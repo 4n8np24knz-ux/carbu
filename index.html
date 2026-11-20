@@ -82,7 +82,14 @@ function age(s) {
   const h = (Date.now() - new Date(d)) / 36e5;
   return "Prix mis à jour il y a " + (h < 48 ? Math.max(1, Math.round(h)) + " h" : Math.round(h / 24) + " jours");
 }
-const status = m => { $("#status").textContent = m; $("#status").style.display = m ? "block" : "none"; };
+let base = "", t0 = 0;
+const paint = () => {
+  const el = $("#status");
+  el.textContent = base && busy ? base + " " + Math.round((Date.now() - t0) / 1000) + " s" : base;
+  el.style.display = base ? "block" : "none";
+};
+const status = m => { base = m; t0 = Date.now(); paint(); };
+setInterval(() => { if (busy) paint(); }, 1000);
 
 function renderChips() {
   $("#chips").innerHTML = FUELS.map(([k, n]) =>
@@ -104,7 +111,7 @@ async function overpass(q) {
   const tries = OVERPASS.map(async url => {
     const host = new URL(url).host;
     const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), 25000);
+    const t = setTimeout(() => ac.abort(), 60000);
     try {
       const r = await fetch(url, { method: "POST", body: "data=" + encodeURIComponent(q), signal: ac.signal });
       if (!r.ok) throw new Error(host + " : erreur " + r.status);
@@ -131,29 +138,75 @@ function fromCache(c) {
   if (Date.now() - c.t > 30 * 864e5) return null;
   const off = km(c, me);
   const items = c.items.map(p => ({ ...p, d: km(me, p) })).sort((a, b) => a.d - b.d).slice(0, 10);
+  if (!items.length) return null;
   const ok = items.length >= 10 ? items[9].d <= c.R - off : off < 5;
   return ok ? items : null;
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function parseOverpass(els) {
+  const items = [];
+  for (const el of els) {
+    const p = { lat: el.lat ?? el.center?.lat, lon: el.lon ?? el.center?.lon };
+    if (p.lat == null || items.some(o => km(o, p) < 0.06)) continue;
+    p.name = el.tags.name || "TotalEnergies";
+    p.addr = [el.tags["addr:housenumber"], el.tags["addr:street"], el.tags["addr:city"]].filter(Boolean).join(" ");
+    p.id = el.type + el.id;
+    items.push(p);
+  }
+  return items;
+}
+
+// Solution de secours : recherche par nom (Nominatim), rapide mais moins complète.
+async function nominatim() {
+  const d = 0.3, vb = [me.lon - d, me.lat + d, me.lon + d, me.lat - d].join(",");
+  const u = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=40&bounded=1&q=TotalEnergies&viewbox=" + vb;
+  const r = await fetch(u);
+  if (!r.ok) throw new Error("nominatim.openstreetmap.org : erreur " + r.status);
+  const items = [];
+  for (const x of await r.json()) {
+    if (x.type !== "fuel") continue;
+    const p = { lat: +x.lat, lon: +x.lon };
+    if (items.some(o => km(o, p) < 0.06)) continue;
+    p.name = x.name || "TotalEnergies";
+    p.addr = (x.display_name || "").split(",").slice(0, 3).join(",");
+    p.id = "n" + x.place_id;
+    items.push(p);
+  }
+  if (!items.length) throw new Error("nominatim : aucun résultat");
+  return items;
+}
+
 async function fetchOsm() {
   const cache = loadCache();
   for (const c of cache) { const r = fromCache(c); if (r) return r; }
-  let items = [], R = 0;
-  for (R of [20, 50]) {
-    const a = `(around:${R * 1000},${me.lat},${me.lon})`;
-    const q = `[out:json][timeout:25];(nwr["amenity"="fuel"]["brand"~"Total",i]${a};nwr["amenity"="fuel"]["name"~"Total",i]${a};);out center tags;`;
-    const els = (await overpass(q)).elements;
-    items = [];
-    for (const el of els) {
-      const p = { lat: el.lat ?? el.center?.lat, lon: el.lon ?? el.center?.lon };
-      if (p.lat == null || items.some(o => km(o, p) < 0.06)) continue;
-      p.name = el.tags.name || "TotalEnergies";
-      p.addr = [el.tags["addr:housenumber"], el.tags["addr:street"], el.tags["addr:city"]].filter(Boolean).join(" ");
-      p.id = el.type + el.id;
-      items.push(p);
+  let done = false;
+  const viaOverpass = async () => {
+    let items = [], R = 0;
+    for (R of [20, 50]) {
+      const a = `(around:${R * 1000},${me.lat},${me.lon})`;
+      const q = `[out:json][timeout:25];(nwr["amenity"="fuel"]["brand"~"Total",i]${a};nwr["amenity"="fuel"]["name"~"Total",i]${a};);out center tags;`;
+      items = parseOverpass((await overpass(q)).elements);
+      if (items.length >= 10) break;
     }
-    if (items.length >= 10) break;
+    if (!items.length) throw new Error("overpass : aucune station");
+    return { items, R, src: "overpass" };
+  };
+  const viaNominatim = async () => {
+    await sleep(5000);
+    if (done) throw new Error("inutile");
+    return { items: await nominatim(), R: 15, src: "nominatim" };
+  };
+  let res;
+  try {
+    res = await Promise.any([viaOverpass(), viaNominatim()]);
+  } catch (agg) {
+    throw new Error((agg.errors || []).map(e => e.message).filter(m => m !== "inutile").join(" ; "));
+  } finally {
+    done = true;
   }
-  const entry = { lat: me.lat, lon: me.lon, R, t: Date.now(), items };
+  // La liste de secours est moins fiable : elle n’est gardée que 2 jours au lieu de 30.
+  const entry = { lat: me.lat, lon: me.lon, R: res.R, t: Date.now() - (res.src === "nominatim" ? 28 * 864e5 : 0), items: res.items };
   saveCache([entry, ...cache]);
   return fromCache(entry) || [];
 }
@@ -174,7 +227,7 @@ async function refresh() {
   busy = true;
   const here = { ...me };
   try {
-    status("Recherche des stations TotalEnergies (jusqu’à 25 s)…");
+    status("Recherche des stations TotalEnergies (jusqu’à 1 min)…");
     const found = await fetchOsm();
     if (!found.length) { stations = []; status("Aucune station TotalEnergies trouvée près de toi."); return; }
     status("Chargement des prix…");
