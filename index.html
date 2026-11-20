@@ -43,13 +43,13 @@ body{font:16px/1.35 -apple-system,system-ui,"Segoe UI",sans-serif;color:var(--in
 </style>
 </head>
 <body>
-<div id="top"><div id="map"></div><button id="refresh">Actualiser (v11)</button></div>
+<div id="top"><div id="map"></div><button id="refresh">Actualiser (v12)</button></div>
 <div id="sheet">
   <div class="chips" id="chips"></div>
   <div id="status"></div>
   <div id="detail"></div>
   <div id="list"></div>
-  <details style="padding:10px 12px"><summary>Détails techniques (v11)</summary><pre id="log" style="white-space:pre-wrap;font-size:12px;margin:8px 0 0"></pre></details>
+  <details style="padding:10px 12px"><summary>Détails techniques (v12)</summary><pre id="log" style="white-space:pre-wrap;font-size:12px;margin:8px 0 0"></pre></details>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -76,12 +76,32 @@ function km(a, b) {
   const h = Math.sin(dl / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dn / 2) ** 2;
   return 12742 * Math.asin(Math.sqrt(h));
 }
-const price = s => { const v = s.g && s.g[fuel + "_prix"]; return v == null ? null : Number(v); };
+const FUEL_LABEL = { gazole: "Gazole", sp95: "SP95", sp98: "SP98", e10: "E10", e85: "E85", gplc: "GPLc" };
+const MAX_PRICE_AGE_HOURS = 24;
+const listField = v => Array.isArray(v) ? v : (typeof v === "string" ? v.split(/[;,|]/).map(x => x.trim()).filter(Boolean) : []);
+const normFuel = v => String(v || "").normalize("NFD").replace(/[\\u0300-\\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+function confirmedAvailable(g, key) {
+  if (!g) return false;
+  const label = FUEL_LABEL[key];
+  const availableList = listField(g.carburants_disponibles);
+  const available = availableList.length === 0 || availableList.some(x => normFuel(x) === normFuel(label));
+  const unavailable = listField(g.carburants_indisponibles).some(x => normFuel(x) === normFuel(label));
+  const ruptureList = listField(g.carburants_rupture_definitive).concat(listField(g.carburants_rupture_temporaire));
+  const ruptureField = g[key + "_rupture_type"];
+  if (!available || unavailable || ruptureList.some(x => normFuel(x) === normFuel(label)) || (ruptureField && String(ruptureField).trim())) return false;
+  const updated = g[key + "_maj"];
+  if (!updated) return false;
+  const hours = (Date.now() - new Date(updated).getTime()) / 36e5;
+  if (!Number.isFinite(hours) || hours < -1 || hours > MAX_PRICE_AGE_HOURS) return false;
+  const value = Number(g[key + "_prix"]);
+  return Number.isFinite(value) && value > 0;
+}
+const price = s => confirmedAvailable(s.g, fuel) ? Number(s.g[fuel + "_prix"]) : null;
 const fmt = p => p.toFixed(3).replace(".", ",") + " €";
 function age(s) {
   const d = s.g && s.g[fuel + "_maj"];
   if (!d) return "";
-  const h = (Date.now() - new Date(d)) / 36e5;
+  const h = Math.max(0, (Date.now() - new Date(d).getTime()) / 36e5);
   return "Prix mis à jour il y a " + (h < 48 ? Math.max(1, Math.round(h)) + " h" : Math.round(h / 24) + " jours");
 }
 const logLines = [], tStart = Date.now();
@@ -115,12 +135,13 @@ $("#chips").addEventListener("click", e => {
 
 /* ---------- Stations (OpenStreetMap) avec cache sur le téléphone ---------- */
 async function overpass(q) {
-  // Les 3 serveurs sont interrogés en même temps : le plus rapide gagne.
-  const tries = OVERPASS.map(async url => {
+  // Les serveurs sont essayés en parallèle; dès qu'un répond, les autres sont annulés.
+  const controllers = OVERPASS.map(() => new AbortController());
+  const tries = OVERPASS.map(async (url, i) => {
     const host = new URL(url).host;
-    const ac = new AbortController();
+    const ac = controllers[i];
     const t1 = Date.now();
-    const t = setTimeout(() => ac.abort(), 30000);
+    const t = setTimeout(() => ac.abort(), 20000);
     try {
       const r = await fetch(url, { method: "POST", body: "data=" + encodeURIComponent(q), signal: ac.signal });
       if (!r.ok) throw new Error(host + " : erreur " + r.status);
@@ -129,7 +150,7 @@ async function overpass(q) {
       dbg(host + " : réponse OK, " + (j.elements || []).length + " éléments en " + ((Date.now() - t1) / 1000).toFixed(1) + " s");
       return j;
     } catch (e) {
-      const err = new Error(e.name === "AbortError" ? host + " : trop lent" : (e.message.startsWith(host) ? e.message : host + " : " + e.message));
+      const err = new Error(e.name === "AbortError" ? host + " : requête annulée ou trop lente" : (e.message.startsWith(host) ? e.message : host + " : " + e.message));
       dbg(err.message + " (" + ((Date.now() - t1) / 1000).toFixed(1) + " s)");
       throw err;
     } finally {
@@ -137,7 +158,9 @@ async function overpass(q) {
     }
   });
   try {
-    return await Promise.any(tries);
+    const winner = await Promise.any(tries);
+    controllers.forEach(c => c.abort());
+    return winner;
   } catch (agg) {
     throw new Error((agg.errors || []).map(e => e.message).join(" ; "));
   }
@@ -147,11 +170,13 @@ const saveCache = c => { try { localStorage.setItem(CK, JSON.stringify(c.slice(0
 
 // Renvoie les 10 plus proches si la zone mémorisée suffit, sinon null.
 function fromCache(c) {
-  if (Date.now() - c.t > 30 * 864e5) return null;
+  if (Date.now() - c.t > 7 * 864e5) return null;
   const off = km(c, me);
-  const items = c.items.map(p => ({ ...p, d: km(me, p) })).sort((a, b) => a.d - b.d).slice(0, 10);
+  const items = c.items.map(p => ({ ...p, d: km(me, p) })).sort((a, b) => a.d - b.d);
   if (!items.length) return null;
-  const ok = items.length >= 10 ? items[9].d <= c.R - off : off < 5;
+  // Le cache n'est réutilisé que presque au même point GPS pour ne pas omettre
+  // des stations situées au bord du rayon de 50 km.
+  const ok = c.R >= 50 && off < 0.05;
   return ok ? items : null;
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -171,7 +196,7 @@ function parseOverpass(els) {
 
 // Solution de secours : recherche par nom (Nominatim), rapide mais moins complète.
 async function nominatim() {
-  const d = 0.3, vb = [me.lon - d, me.lat + d, me.lon + d, me.lat - d].join(",");
+  const d = 0.55, vb = [me.lon - d, me.lat + d, me.lon + d, me.lat - d].join(",");
   const items = [];
   let lastErr = "";
   // Plusieurs noms : « Total », « TotalEnergies » et « Total Access » ne sont pas trouvés par la même recherche.
@@ -215,13 +240,12 @@ async function fetchOsm(onPartial) {
   let res;
   try {
     let items = [], R = 0;
-    for (R of [20, 50]) {
-      const a = `(around:${R * 1000},${me.lat},${me.lon})`;
-      const q = `[out:json][timeout:25];(nwr["amenity"="fuel"]["brand"~"Total",i]${a};nwr["amenity"="fuel"]["name"~"Total",i]${a};);out center tags;`;
-      items = parseOverpass((await overpass(q)).elements);
-      dbg("Overpass (rayon " + R + " km) : " + items.length + " station(s)");
-      if (items.length >= 10) break;
-    }
+    R = 50;
+    const a = `(around:${R * 1000},${me.lat},${me.lon})`;
+    const tagFilter = tag => `nwr["amenity"="fuel"]["${tag}"~"Total",i]${a};`;
+    const q = `[out:json][timeout:25];(${["brand","brand:fr","operator","name"].map(tagFilter).join("")});out center tags;`;
+    items = parseOverpass((await overpass(q)).elements);
+    dbg("Overpass (rayon 50 km, marque/exploitant/nom) : " + items.length + " station(s)");
     if (!items.length) throw new Error("overpass : aucune station");
     res = { items, R };
   } catch (e) {
@@ -229,7 +253,7 @@ async function fetchOsm(onPartial) {
     if (partial) {
       lastSrc = "nominatim";
       saveCache([{ lat: me.lat, lon: me.lon, R: 15, t: Date.now() - 28 * 864e5, items: partial }, ...cache]);
-      return partial.map(p => ({ ...p, d: km(me, p) })).sort((a, b) => a.d - b.d).slice(0, 10);
+      return partial.map(p => ({ ...p, d: km(me, p) })).sort((a, b) => a.d - b.d);
     }
     throw new Error(e.message + (nomErr ? " ; " + nomErr : ""));
   }
@@ -259,7 +283,15 @@ const overlap = (a, b) => { const A = words(a); for (const w of words(b)) if (A.
 
 async function attachPrices(list) {
   let gov = [], err = "";
-  try { gov = await fetchGov(list); } catch (e) { err = e.message; }
+  try {
+    // Petits lots pour éviter une URL géographique trop longue et la limite de 100 résultats.
+    const batches = [];
+    for (let i = 0; i < list.length; i += 10) batches.push(list.slice(i, i + 10));
+    const responses = await Promise.allSettled(batches.map(batch => fetchGov(batch)));
+    gov = responses.filter(x => x.status === "fulfilled").flatMap(x => x.value);
+    const failed = responses.filter(x => x.status === "rejected");
+    if (failed.length) err = failed.length + " lot(s) de prix non récupéré(s)";
+  } catch (e) { err = e.message; }
   for (const s of list) {
     let best = null, bd = 9;
     for (const g of gov) {
@@ -367,7 +399,7 @@ function select(id, pan = true) {
     <p>À environ ${s.d.toFixed(1).replace(".", ",")} km de toi (à vol d’oiseau)</p>
     ${p != null
       ? `<p class="big">${fmt(p)}/L</p>${s === best ? '<p class="tag">La moins chère des ' + stations.length + "</p>" : ""}<p>${age(s)}</p>`
-      : (s.g ? "<p>Ce carburant n’est pas vendu dans cette station.</p>" : "<p>Station non retrouvée dans les prix officiels.</p>")}
+      : (s.g ? "<p>Disponibilité ou prix non confirmés récemment (donnée absente, en rupture ou mise à jour depuis plus de 24 h).</p>" : "<p>Station non rapprochée d’un enregistrement officiel : prix non confirmé.</p>")}
     <div class="go">
       <a class="btn" href="https://maps.apple.com/?daddr=${s.lat},${s.lon}&dirflg=d">Lancer l’itinéraire</a>
       <a class="btn alt" href="https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lon}&travelmode=driving">Google Maps</a>
